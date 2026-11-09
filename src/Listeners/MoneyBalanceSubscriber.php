@@ -1,0 +1,498 @@
+<?php
+
+namespace Huoxin\MoneyWithHistory\Listeners;
+
+use Flarum\Discussion\Discussion;
+use Flarum\Discussion\Event\Deleting as DiscussionDeleting;
+use Flarum\Discussion\Event\Hidden as DiscussionHidden;
+use Flarum\Discussion\Event\Restored as DiscussionRestored;
+use Flarum\Discussion\Event\Started;
+use Flarum\Post\Event\Deleted as PostDeleted;
+use Flarum\Post\Event\Hidden as PostHidden;
+use Flarum\Post\Event\Posted;
+use Flarum\Post\Event\Restored as PostRestored;
+use Flarum\Post\Post;
+use Flarum\Settings\SettingsRepositoryInterface;
+use Flarum\User\Event\Saving;
+use Flarum\User\User;
+use Huoxin\MoneyWithHistory\Job\CascadeDiscussionPostsChunk;
+use Huoxin\MoneyWithHistory\Service\BalanceManager;
+use Huoxin\MoneyWithHistory\Support\PostContentHelper;
+use Illuminate\Contracts\Events\Dispatcher;
+use Illuminate\Contracts\Queue\Queue;
+use Illuminate\Support\Arr;
+
+class MoneyBalanceSubscriber
+{
+    private const AUTO_REMOVE_NEVER = 0;
+    private const AUTO_REMOVE_HIDDEN = 1;
+    private const AUTO_REMOVE_DELETED = 2;
+
+    public const SOURCE_POST_WAS_POSTED = 'POST_POSTED';
+    public const SOURCE_POST_WAS_RESTORED = 'POST_RESTORED';
+    public const SOURCE_POST_WAS_HIDDEN = 'POST_HIDDEN';
+    public const SOURCE_POST_WAS_DELETED = 'POST_DELETED';
+    public const SOURCE_DISCUSSION_WAS_STARTED = 'DISCUSSION_STARTED';
+    public const SOURCE_DISCUSSION_WAS_RESTORED = 'DISCUSSION_RESTORED';
+    public const SOURCE_DISCUSSION_WAS_HIDDEN = 'DISCUSSION_HIDDEN';
+    public const SOURCE_DISCUSSION_WAS_DELETED = 'DISCUSSION_DELETED';
+    public const SOURCE_MANUAL_ADJUSTMENT = 'MANUAL_ADJUSTMENT';
+    public const SOURCE_POST_WAS_LIKED = 'POST_LIKED';
+    public const SOURCE_POST_WAS_UNLIKED = 'POST_UNLIKED';
+
+    public function __construct(
+        protected SettingsRepositoryInterface $settings,
+        protected BalanceManager $balances,
+        protected Queue $queue
+    ) {
+    }
+
+    public function getPostRewardAmount(): float
+    {
+        return (float) $this->settings->get('huoxin-money-with-history.post_reward_amount', 0);
+    }
+
+    public function getMinPostLength(): int
+    {
+        return (int) $this->settings->get('huoxin-money-with-history.min_post_length', 0);
+    }
+
+    public function getDiscussionRewardAmount(): float
+    {
+        return (float) $this->settings->get('huoxin-money-with-history.discussion_reward_amount', 0);
+    }
+
+    public function getLikeRewardAmount(): float
+    {
+        return (float) $this->settings->get('huoxin-money-with-history.like_reward_amount', 0);
+    }
+
+    public function getRemoveMoneyTrigger(): int
+    {
+        return (int) $this->settings->get('huoxin-money-with-history.remove_money_trigger', 1);
+    }
+
+    public function isCascadeMoneyRemoval(): bool
+    {
+        return (bool) $this->settings->get('huoxin-money-with-history.cascade_money_removal', false);
+    }
+
+    public function isExcludeMentionsFromLength(): bool
+    {
+        return (bool) $this->settings->get('huoxin-money-with-history.exclude_mentions_from_length', false);
+    }
+
+    public function isPrivateDiscussionRewarded(): bool
+    {
+        return (bool) $this->settings->get('huoxin-money-with-history.reward_private_discussion', false);
+    }
+
+    public function isSelfLikeRewarded(): bool
+    {
+        return (bool) $this->settings->get('huoxin-money-with-history.reward_self_like', false);
+    }
+
+    public function subscribe(Dispatcher $events): void
+    {
+        $events->listen(Posted::class, [$this, 'postWasPosted']);
+        $events->listen(PostRestored::class, [$this, 'postWasRestored']);
+        $events->listen(PostHidden::class, [$this, 'postWasHidden']);
+        $events->listen(PostDeleted::class, [$this, 'postWasDeleted']);
+        $events->listen(Started::class, [$this, 'discussionWasStarted']);
+        $events->listen(DiscussionRestored::class, [$this, 'discussionWasRestored']);
+        $events->listen(DiscussionHidden::class, [$this, 'discussionWasHidden']);
+        $events->listen(DiscussionDeleting::class, [$this, 'discussionWillBeDeleted']);
+        $events->listen(Saving::class, [$this, 'userWillBeSaved']);
+    }
+
+    private function canEarnMoneyInTags(User $user, iterable $tags): bool
+    {
+        if ($user->isAdmin()) {
+            return true;
+        }
+
+        foreach ($tags as $tag) {
+            if ($user->hasPermission("tag{$tag->id}.discussion.money.disable_money")) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public function adjustPostAuthorBalance(
+        ?User $user,
+        float $balanceDelta,
+        Post $post,
+        string $source = '',
+        string $sourceKey = '',
+        ?User $actor = null,
+        array $sourceParams = []
+    ): void {
+        if ($user === null) {
+            return;
+        }
+
+        if ($this->canEarnMoneyInTags($user, $post->discussion->tags ?? [])) {
+            $this->balances->adjustBalance($user, $balanceDelta, $source, $sourceKey, $sourceParams, $actor);
+        }
+    }
+
+    public function adjustDiscussionAuthorBalance(
+        ?User $user,
+        float $balanceDelta,
+        Discussion $discussion,
+        string $source = '',
+        string $sourceKey = '',
+        ?User $actor = null,
+        array $sourceParams = []
+    ): void {
+        if ($user === null) {
+            return;
+        }
+
+        if ($this->canEarnMoneyInTags($user, $discussion->tags ?? [])) {
+            $this->balances->adjustBalance($user, $balanceDelta, $source, $sourceKey, $sourceParams, $actor);
+        }
+    }
+
+    public function sourceKey(string $name): string
+    {
+        return "huoxin-money-with-history.forum.money-history.{$name}";
+    }
+
+    public function postWasPosted(Posted $event): void
+    {
+        if (isset($event->post->is_approved) && ! $event->post->is_approved) {
+            return;
+        }
+
+        if (! $this->isPrivateDiscussionRewarded() && isset($event->post->discussion->is_private) && $event->post->discussion->is_private) {
+            return;
+        }
+
+        $content = $this->isExcludeMentionsFromLength() ? PostContentHelper::stripMentions($event->post->content) : $event->post->content;
+        if (
+            $event->post->number > 1
+            && mb_strlen($content) >= $this->getMinPostLength()
+        ) {
+            $this->adjustPostAuthorBalance(
+                $event->post->user,
+                $this->getPostRewardAmount(),
+                $event->post,
+                self::SOURCE_POST_WAS_POSTED,
+                $this->sourceKey('post-reward'),
+                $event->actor
+            );
+        }
+    }
+
+    public function postWasRestored(PostRestored $event): void
+    {
+        if (isset($event->post->is_approved) && ! $event->post->is_approved) {
+            return;
+        }
+
+        if (! $this->isPrivateDiscussionRewarded() && isset($event->post->discussion->is_private) && $event->post->discussion->is_private) {
+            return;
+        }
+
+        $content = $this->isExcludeMentionsFromLength() ? PostContentHelper::stripMentions($event->post->content) : $event->post->content;
+        if (
+            $this->getRemoveMoneyTrigger() == self::AUTO_REMOVE_HIDDEN
+            && $event->post->type == 'comment'
+            && mb_strlen($content) >= $this->getMinPostLength()
+        ) {
+            $this->adjustPostAuthorBalance(
+                $event->post->user,
+                $this->getPostRewardAmount(),
+                $event->post,
+                self::SOURCE_POST_WAS_RESTORED,
+                $this->sourceKey('post-restored'),
+                $event->actor
+            );
+        }
+    }
+
+    public function postWasHidden(PostHidden $event): void
+    {
+        // Flarum automatically sets is_approved to true when hiding an unapproved post.
+        // If it was just changed, it means it was a rejection, so it never earned money.
+        if ($event->post->wasChanged('is_approved')) {
+            return;
+        }
+
+        if (isset($event->post->is_approved) && ! $event->post->is_approved) {
+            return;
+        }
+
+        if (! $this->isPrivateDiscussionRewarded() && isset($event->post->discussion->is_private) && $event->post->discussion->is_private) {
+            return;
+        }
+
+        $content = $this->isExcludeMentionsFromLength() ? PostContentHelper::stripMentions($event->post->content) : $event->post->content;
+        if (
+            $this->getRemoveMoneyTrigger() == self::AUTO_REMOVE_HIDDEN
+            && $event->post->type == 'comment'
+            && mb_strlen($content) >= $this->getMinPostLength()
+        ) {
+            $this->adjustPostAuthorBalance(
+                $event->post->user,
+                -1 * $this->getPostRewardAmount(),
+                $event->post,
+                self::SOURCE_POST_WAS_HIDDEN,
+                $this->sourceKey('post-hidden'),
+                $event->actor
+            );
+        }
+    }
+
+    public function postWasDeleted(PostDeleted $event): void
+    {
+        if ($event->post->wasChanged('is_approved')) {
+            return;
+        }
+
+        if (isset($event->post->is_approved) && ! $event->post->is_approved) {
+            return;
+        }
+
+        if (! $this->isPrivateDiscussionRewarded() && isset($event->post->discussion->is_private) && $event->post->discussion->is_private) {
+            return;
+        }
+
+        $content = $this->isExcludeMentionsFromLength() ? PostContentHelper::stripMentions($event->post->content) : $event->post->content;
+
+        $shouldRemove = ($this->getRemoveMoneyTrigger() == self::AUTO_REMOVE_DELETED) ||
+            ($this->getRemoveMoneyTrigger() == self::AUTO_REMOVE_HIDDEN && $event->post->hidden_at === null);
+
+        if (
+            $shouldRemove
+            && $event->post->type == 'comment'
+            && mb_strlen($content) >= $this->getMinPostLength()
+        ) {
+            $this->adjustPostAuthorBalance(
+                $event->post->user,
+                -1 * $this->getPostRewardAmount(),
+                $event->post,
+                self::SOURCE_POST_WAS_DELETED,
+                $this->sourceKey('post-deleted'),
+                $event->actor
+            );
+        }
+    }
+
+    public function discussionWasStarted(Started $event): void
+    {
+        if (isset($event->discussion->is_approved) && ! $event->discussion->is_approved) {
+            return;
+        }
+
+        if (! $this->isPrivateDiscussionRewarded() && isset($event->discussion->is_private) && $event->discussion->is_private) {
+            return;
+        }
+
+        $this->adjustDiscussionAuthorBalance(
+            $event->discussion->user,
+            $this->getDiscussionRewardAmount(),
+            $event->discussion,
+            self::SOURCE_DISCUSSION_WAS_STARTED,
+            $this->sourceKey('discussion-reward'),
+            $event->actor
+        );
+    }
+
+    public function discussionWasRestored(DiscussionRestored $event): void
+    {
+        if (isset($event->discussion->is_approved) && ! $event->discussion->is_approved) {
+            return;
+        }
+
+        if (! $this->isPrivateDiscussionRewarded() && isset($event->discussion->is_private) && $event->discussion->is_private) {
+            return;
+        }
+
+        if ($this->getRemoveMoneyTrigger() == self::AUTO_REMOVE_HIDDEN) {
+            $this->adjustDiscussionAuthorBalance(
+                $event->discussion->user,
+                $this->getDiscussionRewardAmount(),
+                $event->discussion,
+                self::SOURCE_DISCUSSION_WAS_RESTORED,
+                $this->sourceKey('discussion-restored'),
+                $event->actor
+            );
+
+            $this->discussionCascadePosts(
+                $event->discussion,
+                1,
+                self::SOURCE_POST_WAS_RESTORED,
+                $this->sourceKey('post-restored'),
+                $event->actor
+            );
+        }
+    }
+
+    public function discussionWasHidden(DiscussionHidden $event): void
+    {
+        // Flarum automatically sets is_approved to true when hiding an unapproved discussion.
+        if ($event->discussion->wasChanged('is_approved')) {
+            return;
+        }
+
+        if (isset($event->discussion->is_approved) && ! $event->discussion->is_approved) {
+            return;
+        }
+
+        if (! $this->isPrivateDiscussionRewarded() && isset($event->discussion->is_private) && $event->discussion->is_private) {
+            return;
+        }
+
+        if ($this->getRemoveMoneyTrigger() == self::AUTO_REMOVE_HIDDEN) {
+            $this->adjustDiscussionAuthorBalance(
+                $event->discussion->user,
+                -$this->getDiscussionRewardAmount(),
+                $event->discussion,
+                self::SOURCE_DISCUSSION_WAS_HIDDEN,
+                $this->sourceKey('discussion-hidden'),
+                $event->actor
+            );
+
+            $this->discussionCascadePosts(
+                $event->discussion,
+                -1,
+                self::SOURCE_POST_WAS_HIDDEN,
+                $this->sourceKey('post-hidden'),
+                $event->actor
+            );
+        }
+    }
+
+    public function discussionWillBeDeleted(DiscussionDeleting $event): void
+    {
+        if ($event->discussion->wasChanged('is_approved')) {
+            return;
+        }
+
+        if (isset($event->discussion->is_approved) && ! $event->discussion->is_approved) {
+            return;
+        }
+
+        if (! $this->isPrivateDiscussionRewarded() && isset($event->discussion->is_private) && $event->discussion->is_private) {
+            return;
+        }
+
+        $shouldRemove = ($this->getRemoveMoneyTrigger() == self::AUTO_REMOVE_DELETED) ||
+            ($this->getRemoveMoneyTrigger() == self::AUTO_REMOVE_HIDDEN && $event->discussion->hidden_at === null);
+
+        if (! $shouldRemove) {
+            return;
+        }
+
+        $this->adjustDiscussionAuthorBalance(
+            $event->discussion->user,
+            -$this->getDiscussionRewardAmount(),
+            $event->discussion,
+            self::SOURCE_DISCUSSION_WAS_DELETED,
+            $this->sourceKey('discussion-deleted'),
+            $event->actor
+        );
+
+        if (! $this->isCascadeMoneyRemoval()) {
+            return;
+        }
+
+        $this->discussionCascadePosts(
+            $event->discussion,
+            -1,
+            self::SOURCE_DISCUSSION_WAS_DELETED,
+            $this->sourceKey('discussion-deleted'),
+            $event->actor
+        );
+    }
+
+    protected function discussionCascadePosts(
+        Discussion $discussion,
+        int $multiply,
+        string $source,
+        string $sourceKey,
+        ?User $actor = null
+    ): void {
+        if (! $this->isCascadeMoneyRemoval()) {
+            return;
+        }
+
+        $tagIds = $discussion->tags ? $discussion->tags->pluck('id')->toArray() : [];
+        $actorId = $actor ? $actor->id : null;
+
+        $discussion->posts()
+            ->select(['user_id', 'content'])
+            ->where('type', 'comment')
+            ->where('number', '>', 1)
+            ->whereNull('hidden_at')
+            ->getQuery() // Fall back to raw QueryBuilder to prevent instantiating Eloquent Models
+            ->chunk(500, function ($posts) use ($tagIds, $actorId, $multiply, $source, $sourceKey) {
+                $userPostCounts = [];
+
+                foreach ($posts as $post) {
+                    $content = $this->isExcludeMentionsFromLength() ? PostContentHelper::stripMentions($post->content ?? '') : ($post->content ?? '');
+
+                    if (mb_strlen($content) >= $this->getMinPostLength()) {
+                        $userId = $post->user_id ?? null;
+                        if ($userId) {
+                            $userPostCounts[$userId] = ($userPostCounts[$userId] ?? 0) + 1;
+                        }
+                    }
+                }
+
+                if (empty($userPostCounts)) {
+                    return;
+                }
+
+                $this->queue->push(new CascadeDiscussionPostsChunk(
+                    $userPostCounts,
+                    $multiply,
+                    $source,
+                    $sourceKey,
+                    $tagIds,
+                    $actorId
+                ));
+            });
+    }
+
+    public function userWillBeSaved(Saving $event): void
+    {
+        $attributes = Arr::get($event->data, 'attributes', []);
+
+        if (! array_key_exists('money', $attributes)) {
+            return;
+        }
+
+        $user = $event->user;
+        $actor = $event->actor;
+        $actor->assertCan('edit_money', $user);
+
+        $balanceDelta = (float) $attributes['money'] - (float) $user->money;
+
+        if ($balanceDelta !== 0.0) {
+            $reason = trim((string) Arr::get($attributes, 'editMoneyReason', ''));
+            $hasReason = $reason !== '';
+
+            $sourceKey = $hasReason
+                ? $this->sourceKey('manual-adjustment-with-reason')
+                : $this->sourceKey('manual-adjustment');
+
+            $sourceParams = $hasReason
+                ? ['reason' => mb_substr($reason, 0, 255)]
+                : [];
+
+            $this->balances->applyBalanceChange(
+                $user,
+                $balanceDelta,
+                self::SOURCE_MANUAL_ADJUSTMENT,
+                $sourceKey,
+                $sourceParams,
+                $actor
+            );
+        }
+    }
+}

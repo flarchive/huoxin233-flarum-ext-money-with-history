@@ -1,0 +1,15 @@
+name: Money With History PHP
+
+on: [workflow_dispatch, push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    uses: flarum/framework/.github/workflows/REUSABLE_backend.yml@1.x
+    with:
+      enable_backend_testing: true
+      php_versions: '["8.0", "8.1", "8.2", "8.3", "8.4"]'
+
+      backend_directory: .

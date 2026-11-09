@@ -1,0 +1,39 @@
+name: Draft release from commits
+
+on:
+  push:
+    branches: ["1.x", "2.x"]
+  workflow_dispatch:
+    inputs:
+      previous_tag:
+        description: "Override previous tag (e.g. v1.0.0-beta.3). Leave blank to auto-detect."
+        required: false
+        type: string
+      next_tag:
+        description: "Override next tag (e.g. v2.0.0-beta.1). Leave blank to auto-calculate."
+        required: false
+        type: string
+      include_full_commits:
+        description: "Include full commit messages in the release body?"
+        required: true
+        type: boolean
+        default: false
+      exclude_co_authors:
+        description: "Exclude the Co-authored-by footer lines?"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  draft-release:
+    uses: huoxin233/flarum-workflows/.github/workflows/REUSABLE-draft-release.yml@main
+    with:
+      previous_tag: ${{ github.event.inputs.previous_tag }}
+      next_tag: ${{ github.event.inputs.next_tag }}
+      include_full_commits: ${{ github.event.inputs.include_full_commits == 'true' || false }}
+      exclude_co_authors: ${{ github.event.inputs.exclude_co_authors != 'false' || true }}
+    secrets: inherit

@@ -1,0 +1,115 @@
+{
+    "name": "huoxin/money-with-history",
+    "description": "A unified Flarum extension that adds a virtual currency system with full transaction history tracking.",
+    "keywords": [
+        "flarum",
+        "money",
+        "currency",
+        "history",
+        "balance"
+    ],
+    "type": "flarum-extension",
+    "license": "MIT",
+    "require": {
+        "flarum/core": "^1.2.0"
+    },
+    "provide": {
+        "antoinefr/flarum-ext-money": "^1.4.0"
+      },
+    "authors": [
+        {
+            "name": "huoxin",
+            "email": "23447157+huoxin233@users.noreply.github.com",
+            "role": "Developer"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/huoxin233/flarum-ext-money-with-history/issues",
+        "source": "https://github.com/huoxin233/flarum-ext-money-with-history",
+        "forum": "https://discuss.flarum.org/d/39319"
+    },
+    "funding": [
+        {
+            "type": "buymeacoffee",
+            "url": "https://www.buymeacoffee.com/huoxin"
+        },
+        {
+            "type": "ko-fi",
+            "url": "https://ko-fi.com/huoxin"
+        }
+    ],
+    "autoload": {
+        "psr-4": {
+            "Huoxin\\MoneyWithHistory\\": "src/"
+        }
+    },
+    "extra": {
+        "flarum-extension": {
+            "title": "Money With History",
+            "category": "feature",
+            "icon": {
+                "name": "fas fa-money-check-dollar",
+                "color": "#fff",
+                "backgroundColor": "#9A2424"
+            },
+            "database-support": [
+                "mysql",
+                "mariadb",
+                "pgsql",
+                "sqlite"
+            ],
+            "optional-dependencies": [
+                "flarum/likes",
+                "flarum/tags"
+            ]
+        },
+        "flarum-cli": {
+            "modules": {
+                "admin": true,
+                "forum": true,
+                "js": true,
+                "jsCommon": false,
+                "css": true,
+                "locale": true,
+                "gitConf": true,
+                "githubActions": true,
+                "prettier": true,
+                "typescript": true,
+                "bundlewatch": false,
+                "backendTesting": true,
+                "editorConfig": true,
+                "styleci": true
+            }
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "autoload-dev": {
+        "psr-4": {
+            "Huoxin\\MoneyWithHistory\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": [
+            "@test:unit",
+            "@test:integration"
+        ],
+        "test:unit": "phpunit -c tests/phpunit.unit.xml",
+        "test:integration": "phpunit -c tests/phpunit.integration.xml",
+        "test:setup": "@php tests/integration/setup.php"
+    },
+    "scripts-descriptions": {
+        "test": "Runs all tests.",
+        "test:unit": "Runs all unit tests.",
+        "test:integration": "Runs all integration tests.",
+        "test:setup": "Sets up a database for use with integration tests. Execute this only once."
+    },
+    "require-dev": {
+        "flarum/testing": "^1.0.0",
+        "flarum/approval": "^1.8.0",
+        "flarum/flags": "^1.8.0",
+        "flarum/tags": "^1.8.0",
+        "flarum/likes": "^1.8.0",
+        "fof/byobu": "^1.0.0"
+    }
+}
