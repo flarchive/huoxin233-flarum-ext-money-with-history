@@ -1,0 +1,85 @@
+import Form from 'flarum/common/components/Form';
+import app from 'flarum/forum/app';
+import { IFormModalAttrs } from 'flarum/common/components/FormModal';
+import FormModal from 'flarum/common/components/FormModal';
+import Button from 'flarum/common/components/Button';
+import Stream from 'flarum/common/utils/Stream';
+import extractText from 'flarum/common/utils/extractText';
+import type Mithril from 'mithril';
+import type User from 'flarum/common/models/User';
+
+interface UserMoneyModalAttrs extends IFormModalAttrs {
+  user: User;
+}
+
+export default class UserMoneyModal extends FormModal<UserMoneyModalAttrs> {
+  money!: Stream<number>;
+  reason!: Stream<string>;
+
+  oninit(vnode: Mithril.Vnode<UserMoneyModalAttrs>) {
+    super.oninit(vnode);
+
+    this.money = Stream(this.attrs.user.attribute<number>('money') || 0);
+    this.reason = Stream('');
+  }
+
+  className(): string {
+    return 'UserMoneyModal Modal--small';
+  }
+
+  title(): Mithril.Children {
+    return app.translator.trans('huoxin-money-with-history.forum.modal.title', { user: this.attrs.user });
+  }
+
+  content(): Mithril.Children {
+    const moneyName = app.forum.attribute<string>('huoxin-money-with-history.money_name') || '[money]';
+
+    return (
+      <div className="Modal-body">
+        <Form>
+          <div className="Form-group">
+            <label>
+              {app.translator.trans('huoxin-money-with-history.forum.modal.current')}{' '}
+              {moneyName.replace('[money]', String(this.attrs.user.attribute<number>('money')))}
+            </label>
+            <input required className="FormControl" type="number" step="any" bidi={this.money} />
+          </div>
+          <div className="Form-group">
+            <label>{app.translator.trans('huoxin-money-with-history.forum.modal.reason')}</label>
+            <textarea
+              className="FormControl"
+              rows={3}
+              bidi={this.reason}
+              placeholder={extractText(app.translator.trans('huoxin-money-with-history.forum.modal.reason_placeholder'))}
+            />
+          </div>
+          <div className="Form-group">
+            <Button className="Button Button--primary" type="submit" loading={this.loading}>
+              {app.translator.trans('huoxin-money-with-history.forum.modal.submit_button')}
+            </Button>
+          </div>
+        </Form>
+      </div>
+    );
+  }
+
+  onsubmit(e: SubmitEvent): void {
+    e.preventDefault();
+
+    this.loading = true;
+
+    this.attrs.user
+      .save(
+        {
+          money: this.money(),
+          editMoneyReason: this.reason(),
+        },
+        { errorHandler: this.onerror.bind(this) }
+      )
+      .then(this.hide.bind(this))
+      .catch(() => {
+        this.loading = false;
+        m.redraw();
+      });
+  }
+}

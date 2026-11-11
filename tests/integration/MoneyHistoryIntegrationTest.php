@@ -1,0 +1,271 @@
+<?php
+
+namespace Huoxin\MoneyWithHistory\Tests\integration;
+
+use Flarum\Testing\integration\RetrievesAuthorizedUsers;
+use Flarum\Testing\integration\TestCase;
+use Flarum\User\User;
+use Huoxin\MoneyWithHistory\Service\BalanceManager;
+use Illuminate\Database\ConnectionInterface;
+use PHPUnit\Framework\Attributes\Test;
+
+class MoneyHistoryIntegrationTest extends TestCase
+{
+    use RetrievesAuthorizedUsers;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->extension('huoxin-money-with-history');
+
+        $this->prepareDatabase([
+            User::class => [
+                $this->normalUser(),
+                ['id' => 3, 'username' => 'bob', 'email' => 'bob@example.com'],
+            ],
+        ]);
+
+        $this->app();
+    }
+
+    #[Test]
+    public function it_records_balance_manager_updates_with_expected_history_fields(): void
+    {
+        $user = User::query()->findOrFail(2);
+        $actor = User::query()->findOrFail(3);
+        $balanceManager = $this->app()->getContainer()->make(BalanceManager::class);
+
+        $this->assertTrue($balanceManager->adjustBalance(
+            $user,
+            5.5,
+            'POST_REWARD',
+            'money.post-reward',
+            [],
+            $actor
+        ));
+
+        $historyEntry = $this->connection()->table('user_money_history')->where('user_id', $user->id)->first();
+
+        $this->assertNotNull($historyEntry);
+        $this->assertEquals(5.5, (float) $historyEntry->balance_delta);
+        $this->assertSame('POST_REWARD', $historyEntry->source);
+        $this->assertSame('money.post-reward', $historyEntry->source_key);
+        $this->assertSame([], json_decode($historyEntry->source_params, true));
+        $this->assertEquals(0.0, (float) $historyEntry->balance_before);
+        $this->assertEquals(5.5, (float) $historyEntry->balance_after);
+        $this->assertSame($actor->id, $historyEntry->actor_id);
+    }
+
+    #[Test]
+    public function it_stores_source_params_as_json_and_returns_them_for_variable_transaction_reasons(): void
+    {
+        $user = User::query()->findOrFail(2);
+        $actor = User::query()->findOrFail(3);
+        $balanceManager = $this->app()->getContainer()->make(BalanceManager::class);
+        $user->money = 50.0;
+        $user->save();
+        $sourceParams = [
+            'itemName' => 'VIP Badge',
+            'itemTypeKey' => 'money-store.forum.item-types.decoration',
+            'purchaseTypeKey' => 'money-store.forum.purchase-types.auto-renew',
+            'purchaseCount' => 2,
+        ];
+
+        $this->assertTrue($balanceManager->adjustBalance(
+            $user,
+            -12.5,
+            'AUTO_RENEW',
+            'money-store.forum.reason.auto-renew',
+            $sourceParams,
+            $actor
+        ));
+
+        $historyEntry = $this->connection()->table('user_money_history')->where('user_id', $user->id)->first();
+
+        $this->assertNotNull($historyEntry);
+        $this->assertSame('money-store.forum.reason.auto-renew', $historyEntry->source_key);
+        $this->assertIsString($historyEntry->source_params);
+        $this->assertJson($historyEntry->source_params);
+        $this->assertJsonStringEqualsJsonString(
+            json_encode($sourceParams, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            $historyEntry->source_params
+        );
+        $this->assertSame($sourceParams, json_decode($historyEntry->source_params, true));
+
+        $response = $this->send(
+            $this->request('GET', '/api/userMoneyHistory', ['authenticatedAs' => 2])
+                ->withQueryParams(['filter' => ['user' => '2']])
+        );
+
+        $payload = json_decode((string) $response->getBody(), true);
+
+        $this->assertEquals(200, $response->getStatusCode());
+        $this->assertCount(1, $payload['data']);
+        $this->assertSame('money-store.forum.reason.auto-renew', $payload['data'][0]['attributes']['sourceKey']);
+        $this->assertSame($sourceParams, $payload['data'][0]['attributes']['sourceParams']);
+    }
+
+    #[Test]
+    public function it_allows_optional_actor_inclusion_via_query_string(): void
+    {
+        $user = User::query()->findOrFail(2);
+        $actor = User::query()->findOrFail(3);
+        $balanceManager = $this->app()->getContainer()->make(BalanceManager::class);
+
+        $this->assertTrue($balanceManager->adjustBalance(
+            $user,
+            10.0,
+            'MANUAL',
+            'manual-adjustment',
+            [],
+            $actor
+        ));
+
+        // 1. Fetch history WITHOUT the actor included
+        $responseWithout = $this->send(
+            $this->request('GET', '/api/userMoneyHistory', [
+                'authenticatedAs' => 2,
+            ])->withQueryParams(['filter' => ['user' => '2']])
+        );
+
+        $payloadWithout = json_decode((string) $responseWithout->getBody(), true);
+        $this->assertEquals(200, $responseWithout->getStatusCode(), 'API threw an error instead of returning 200 OK');
+
+        if (isset($payloadWithout['included'])) {
+            $includedUsersWithout = array_filter($payloadWithout['included'], function ($include) use ($actor) {
+                return $include['type'] === 'users' && $include['id'] === (string) $actor->id;
+            });
+            $this->assertCount(0, $includedUsersWithout, 'The actor should NOT be included by default');
+        } else {
+            $this->assertArrayNotHasKey('included', $payloadWithout);
+        }
+
+        // 2. Fetch history WITH the actor included via query string
+        $responseWith = $this->send(
+            $this->request('GET', '/api/userMoneyHistory', [
+                'authenticatedAs' => 2,
+            ])->withQueryParams([
+                'filter' => ['user' => '2'],
+                'include' => 'actor'
+            ])
+        );
+
+        $payloadWith = json_decode((string) $responseWith->getBody(), true);
+        $this->assertEquals(200, $responseWith->getStatusCode(), 'API threw an error instead of returning 200 OK');
+
+        $this->assertArrayHasKey('included', $payloadWith);
+        $includedUsersWith = array_filter($payloadWith['included'], function ($include) use ($actor) {
+            return $include['type'] === 'users' && $include['id'] === (string) $actor->id;
+        });
+
+        $this->assertCount(1, $includedUsersWith, 'The included array must contain the actor user object when requested');
+    }
+
+    #[Test]
+    public function it_records_batched_balance_manager_updates_for_each_user(): void
+    {
+        $firstUser = User::query()->findOrFail(2);
+        $secondUser = User::query()->findOrFail(3);
+        $actor = User::query()->findOrFail(3);
+        $balanceManager = $this->app()->getContainer()->make(BalanceManager::class);
+
+        $firstUser->money = 10.0;
+        $firstUser->save();
+        $secondUser->money = 20.0;
+        $secondUser->save();
+
+        $updatedCount = $balanceManager->adjustBalances(
+            [$firstUser, $secondUser],
+            4.0,
+            'BATCH_REWARD',
+            'money.batch-reward',
+            [],
+            $actor
+        );
+
+        $records = $this->connection()->table('user_money_history')
+            ->whereIn('user_id', [$firstUser->id, $secondUser->id])
+            ->orderBy('user_id')
+            ->get();
+
+        $this->assertSame(2, $updatedCount);
+        $this->assertCount(2, $records);
+
+        $this->assertSame('BATCH_REWARD', $records[0]->source);
+        $this->assertEquals(4.0, (float) $records[0]->balance_delta);
+        $this->assertEquals(10.0, (float) $records[0]->balance_before);
+        $this->assertEquals(14.0, (float) $records[0]->balance_after);
+
+        $this->assertSame('BATCH_REWARD', $records[1]->source);
+        $this->assertEquals(4.0, (float) $records[1]->balance_delta);
+        $this->assertEquals(20.0, (float) $records[1]->balance_before);
+        $this->assertEquals(24.0, (float) $records[1]->balance_after);
+    }
+
+    #[Test]
+    public function it_does_not_record_zero_delta_or_missing_user_events(): void
+    {
+        $balanceManager = $this->app()->getContainer()->make(BalanceManager::class);
+        $user = User::query()->findOrFail(2);
+
+        $this->assertFalse($balanceManager->adjustBalance(
+            $user,
+            0.0,
+            'ZERO_DELTA',
+            'money.zero-delta'
+        ));
+
+        $this->assertFalse($balanceManager->adjustBalance(
+            null,
+            5.0,
+            'MISSING_USER',
+            'money.missing-user'
+        ));
+
+        $this->assertSame(0, $this->connection()->table('user_money_history')->count());
+    }
+
+    #[Test]
+    public function it_denies_other_users_history_without_permission(): void
+    {
+        $response = $this->send(
+            $this->request('GET', '/api/userMoneyHistory', ['authenticatedAs' => 2])
+                ->withQueryParams(['filter' => ['user' => '3']])
+        );
+
+        $this->assertEquals(403, $response->getStatusCode());
+    }
+
+    #[Test]
+    public function it_successfully_serializes_legacy_records_with_null_source_key_and_params(): void
+    {
+        $this->connection()->table('user_money_history')->insert([
+            'user_id' => 2,
+            'balance_delta' => 10.0,
+            'source' => 'LEGACY_IMPORT',
+            'source_key' => null,
+            'source_params' => null,
+            'balance_before' => 0.0,
+            'balance_after' => 10.0,
+            'actor_id' => 2,
+            'created_at' => '2022-01-01 00:00:00',
+        ]);
+
+        $response = $this->send(
+            $this->request('GET', '/api/userMoneyHistory', ['authenticatedAs' => 2])
+                ->withQueryParams(['filter' => ['user' => '2']])
+        );
+
+        $this->assertEquals(200, $response->getStatusCode());
+        $payload = json_decode((string) $response->getBody(), true);
+        $this->assertCount(1, $payload['data']);
+        $this->assertNull($payload['data'][0]['attributes']['sourceKey']);
+        $this->assertNull($payload['data'][0]['attributes']['sourceParams']);
+    }
+
+    private function connection(): ConnectionInterface
+    {
+        return $this->app()->getContainer()->make(ConnectionInterface::class);
+    }
+}
